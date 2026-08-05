@@ -39,8 +39,14 @@ def crop_regions(frame, face):
     return left_eye, right_eye, mouth
 
 
-def collect(stage, instruction, count, face):
-    """Stage: 'eye_open' | 'eye_closed' | 'mouth_yawn' | 'mouth_no_yawn'."""
+def collect(stage, instruction, count, face, glasses=False):
+    """Stage: 'eye_open' | 'eye_closed' | 'mouth_yawn' | 'mouth_no_yawn'.
+
+    With glasses=True the saved crops get a '_g' suffix, which marks them as
+    "captured with glasses" so finetune.py can train the glasses-specific eye
+    model without mixing appearances (and train_glasses.py can build a
+    glasses-vs-no-glasses classifier)."""
+    suffix = "_g" if glasses else ""
     folder = os.path.join(OUT, stage)
     os.makedirs(folder, exist_ok=True)
     cap = cv2.VideoCapture(0)
@@ -65,10 +71,10 @@ def collect(stage, instruction, count, face):
             if stage.startswith("eye"):
                 for side, crop in (("L", le), ("R", re)):
                     if crop.size:
-                        cv2.imwrite(os.path.join(folder, f"real_{count:05d}_{side}.png"), crop)
+                        cv2.imwrite(os.path.join(folder, f"real_{count:05d}_{side}{suffix}.png"), crop)
             else:  # mouth stages: only the mouth crop (keeps datasets unpolluted)
                 if mouth.size:
-                    cv2.imwrite(os.path.join(folder, f"real_{count:05d}.png"), mouth)
+                    cv2.imwrite(os.path.join(folder, f"real_{count:05d}{suffix}.png"), mouth)
             saved += 1
             count += 1
         left = int(DURATION - (time.time() - start))
@@ -104,7 +110,15 @@ def next_start_count():
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--glasses", action="store_true",
+                    help="tag crops with '_g' (capture while wearing glasses)")
+    args = ap.parse_args()
+
     print("Make sure your face is fully visible, well-lit and centered.")
+    if args.glasses:
+        print("GLASSES MODE: keep your glasses ON for the whole run.")
     time.sleep(2)
     # warm-up / find the face
     cap = cv2.VideoCapture(0)
@@ -133,7 +147,7 @@ def main():
     ]
     for stage, instruction in stages:
         print(f"-> {stage} ...")
-        count = collect(stage, instruction, count, face)
+        count = collect(stage, instruction, count, face, glasses=args.glasses)
         time.sleep(0.6)
     print("calibration complete")
 

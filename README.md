@@ -71,8 +71,9 @@ frame ──► Haar cascade (face) ──► geometric eye/mouth crops
 - `detector.py` — the detection engine (`DrowsinessDetector`, all three modes)
 - `train.py` — trains the CNNs on the synthetic dataset
 - `train_mrl.py` — trains the eye CNN on the MRL Eye Dataset (GPU, cached pipeline)
-- `finetune.py` — fine-tunes both CNNs on your real calibration crops
-- `collect_calibration.py` — guided capture of your eyes/mouth (~30 s)
+- `finetune.py` — fine-tunes the eye CNNs (glasses / no-glasses) + mouth CNN on your real calibration crops
+- `train_glasses.py` — trains the glasses-vs-no-glasses classifier (`glasses_cnn.pth`)
+- `collect_calibration.py` — guided capture of your eyes/mouth (~30 s); `--glasses` tags the crops
 - `generate_data.py` — generates the synthetic eye/mouth dataset
 - `menu.py` — console menu behind `Drowsiness_Detector_Runner.bat`
 - `gui.py` — Tkinter launcher (one of the menu options)
@@ -91,9 +92,25 @@ The detector automatically prefers the fine-tuned `*_real.pth` models when they
 exist. To create them for your own face:
 
 ```bash
-python src/collect_calibration.py   # follow the on-screen prompts
-python src/finetune.py              # fine-tune + save real weights
+# without glasses
+python src/collect_calibration.py
+# if you also wear glasses, run the same capture again with them ON (same
+# lighting/position), using the --glasses flag so the crops get tagged:
+python src/collect_calibration.py --glasses
+
+# then retrain everything:
+python src/finetune.py          # eye_cnn_real.pth (no glasses) + eye_cnn_glasses.pth + mouth_cnn_real.pth
+python src/train_glasses.py     # glasses_cnn.pth (routes the eye model at runtime)
 ```
+
+At runtime the detector classifies each frame as glasses / no-glasses and feeds
+the eye crop to the matching model, so neither appearance's weights are diluted
+by the other. The launcher also asks once at startup whether you are wearing
+glasses: answer **y**/**n** to fix the model (no per-frame re-check) or **s** to
+skip and auto-detect every frame. Capturing both appearances in the *same
+session/lighting* matters: the classifier must learn the frame, not the lighting.
+If you never wear glasses, skip the `--glasses` run and the detector just uses
+the no-glasses model.
 
 ## Project structure
 

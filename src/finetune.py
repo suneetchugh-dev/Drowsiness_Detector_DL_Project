@@ -11,8 +11,14 @@ Usage:
     python src/collect_calibration.py     # 1) capture your face (guided)
     python src/finetune.py                # 2) fine-tune + save real weights
 
-Saved to models/eye_cnn_real.pth and models/mouth_cnn_real.pth, which the
-detector automatically prefers over the synthetic-only models.
+Crops captured with glasses on are tagged '_g' (see collect_calibration.py).
+The eye CNN is trained separately for each appearance:
+    * no-glasses  -> models/eye_cnn_real.pth
+    * with glasses -> models/eye_cnn_glasses.pth
+so neither appearance's weights are diluted by the other. The mouth CNN is
+trained on all crops (glasses do not cover the mouth) and saved to
+models/mouth_cnn_real.pth. The detector picks the eye model based on a
+glasses-vs-no-glasses classifier (models/glasses_cnn.pth, src/train_glasses.py).
 """
 
 import os
@@ -59,32 +65,52 @@ FT_VAL_TFM = T.Compose([
 ])
 
 
-def make_cal_df(kind):
+def _crop_base(name):
+    """real_00260_L_g.png -> real_00260_L  (strip '_g' glasses marker)."""
+    base = name[:-4]                      # drop '.png'
+    return base[:-2] if base.endswith("_g") else base
+
+
+def _is_eye_crop(name):
+    return _crop_base(name).endswith(("_L", "_R"))
+
+
+def make_cal_df(kind, glasses=None):
     """DataFrame of UNIQUE real calibration crops + their label.
 
     Filters by filename suffix so eye crops (_L/_R) never leak into the mouth
-    dataset and vice versa (older captures stored eye crops in every folder)."""
+    dataset and vice versa (older captures stored eye crops in every folder).
+    The 'glasses' column is 1 for crops tagged '_g' (captured with glasses).
+    Setting glasses=0/1 restricts to no-glasses / with-glasses crops."""
     rows = []
     if kind == "eye":
         classes = [("eye_open", 0), ("eye_closed", 1)]
-        is_target = lambda n: n.endswith(("_L.png", "_R.png"))
     else:
         classes = [("mouth_yawn", 1), ("mouth_no_yawn", 0)]
-        is_target = lambda n: n.endswith(".png") and not n.endswith(("_L.png", "_R.png"))
     for folder, label in classes:
         path = os.path.join(CAL_ROOT, folder)
         if not os.path.isdir(path):
             continue
         for n in os.listdir(path):
-            if is_target(n):
-                rows.append({"path": os.path.join(path, n), "label": label})
-    return pd.DataFrame(rows)
+            if not n.endswith(".png"):
+                continue
+            if kind == "eye" and not _is_eye_crop(n):
+                continue
+            if kind == "mouth" and _is_eye_crop(n):
+                continue
+            rows.append({"path": os.path.join(path, n), "label": label,
+                         "glasses": 1 if n.endswith("_g.png") else 0})
+    cal = pd.DataFrame(rows)
+    if glasses is not None:
+        cal = cal[cal["glasses"] == glasses].reset_index(drop=True)
+    return cal
 
 
-def finetune(kind, out_path, pretrained_path):
+def finetune(kind, out_path, pretrained_path, glasses=None):
     synth_train, synth_val, names = build_dfs(kind)
-    cal = make_cal_df(kind)
-    print(f"=== FINETUNE {kind.upper()} | synthetic={len(synth_train)} "
+    cal = make_cal_df(kind, glasses)
+    tag = " (glasses)" if glasses else (" (no glasses)" if glasses is not None else "")
+    print(f"=== FINETUNE {kind.upper()}{tag} | synthetic={len(synth_train)} "
           f"real unique={len(cal)} (x{REPEAT_REAL}) ===")
     if len(cal) == 0:
         print("no calibration data found - skipping")
@@ -129,10 +155,15 @@ def finetune(kind, out_path, pretrained_path):
     print(f"saved -> {out_path}")
 
 
-if __name__ == "__main__":
+def main():
     eye_base = "models/eye_cnn_mrl.pth" if os.path.exists("models/eye_cnn_mrl.pth") \
         else "models/eye_cnn.pth"
     print(f"eye base model: {eye_base}")
-    finetune("eye", "models/eye_cnn_real.pth", eye_base)
+    finetune("eye", "models/eye_cnn_real.pth", eye_base, glasses=0)
+    finetune("eye", "models/eye_cnn_glasses.pth", eye_base, glasses=1)
     finetune("mouth", "models/mouth_cnn_real.pth", "models/mouth_cnn.pth")
     print("done")
+
+
+if __name__ == "__main__":
+    main()

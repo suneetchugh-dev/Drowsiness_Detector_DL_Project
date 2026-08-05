@@ -19,9 +19,9 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 
 class DrowsinessApp:
-    def __init__(self, root):
+    def __init__(self, root, glasses_mode=None):
         self.root = root
-        self.det = DrowsinessDetector(use_yolo=False)
+        self.det = DrowsinessDetector(use_yolo=False, glasses_mode=glasses_mode)
         self.q = queue.Queue()
 
         root.title("Driver Drowsiness Detection")
@@ -139,9 +139,9 @@ class DrowsinessApp:
         os.startfile(out)
 
 
-def main():
+def main(glasses_mode=None):
     root = tk.Tk()
-    DrowsinessApp(root)
+    DrowsinessApp(root, glasses_mode=glasses_mode)
     root.mainloop()
 
 

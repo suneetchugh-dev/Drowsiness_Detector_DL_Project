@@ -29,6 +29,26 @@ MENU = """\
 ----------------------------------------
 """
 
+GLASSES_LABEL = {0: "no glasses (fixed)", 1: "glasses (fixed)", None: "auto-detect"}
+
+
+def ask_glasses():
+    """Ask once whether the driver wears glasses, so we don't have to re-check
+    every frame. Returns 1 (glasses), 0 (no glasses) or None (auto-detect)."""
+    print("\nAre you wearing glasses?")
+    print("   y - yes  -> use the glasses model (no per-frame re-check)")
+    print("   n - no   -> use the normal model")
+    print("   s - skip -> auto-detect glasses every frame")
+    while True:
+        ans = input("Your choice [y/n/s]: ").strip().lower()
+        if ans in ("y", "yes"):
+            return 1
+        if ans in ("n", "no"):
+            return 0
+        if ans in ("s", "skip", ""):
+            return None
+        print("Please enter 'y', 'n' or 's'.")
+
 
 def pick_file(title, kinds):
     root = tk.Tk()
@@ -38,10 +58,10 @@ def pick_file(title, kinds):
     return path
 
 
-def run_gui():
+def run_gui(glasses_mode):
     print("Launching GUI ... close the window to come back to this menu.")
     import gui
-    gui.main()
+    gui.main(glasses_mode)
 
 
 def run_webcam(det):
@@ -78,7 +98,9 @@ def run_image(det):
 
 
 def main():
-    det = DrowsinessDetector(use_yolo=False)
+    glasses_mode = ask_glasses()
+    det = DrowsinessDetector(use_yolo=False, glasses_mode=glasses_mode)
+    print(f"\nGlasses mode: {GLASSES_LABEL[glasses_mode]}")
     while True:
         print(MENU)
         opt = input("Choose an option (1-5, or press 'q' to quit): ").strip().lower()
@@ -86,7 +108,7 @@ def main():
             print("Goodbye.")
             return
         if opt == "1":
-            run_gui()
+            run_gui(glasses_mode)
         elif opt == "2":
             run_webcam(det)
         elif opt == "3":

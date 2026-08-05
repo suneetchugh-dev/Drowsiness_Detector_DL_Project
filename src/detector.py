@@ -29,7 +29,9 @@ MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 EYE_WEIGHTS = os.path.join(MODEL_DIR, "eye_cnn.pth")
 MOUTH_WEIGHTS = os.path.join(MODEL_DIR, "mouth_cnn.pth")
 EYE_WEIGHTS_REAL = os.path.join(MODEL_DIR, "eye_cnn_real.pth")
+EYE_WEIGHTS_GLASSES = os.path.join(MODEL_DIR, "eye_cnn_glasses.pth")
 MOUTH_WEIGHTS_REAL = os.path.join(MODEL_DIR, "mouth_cnn_real.pth")
+GLASSES_WEIGHTS = os.path.join(MODEL_DIR, "glasses_cnn.pth")
 YOLO_WEIGHTS = os.path.join(MODEL_DIR, "yolov8n.pt")
 
 IMG_SIZE = 48
@@ -74,7 +76,7 @@ class DrowsinessDetector:
 
     def __init__(self, device=None, use_yolo=True, yolo_interval=3,
                  closed_frames=CLOSED_FRAMES_ALERT, yawn_frames=YAWN_FRAMES_ALERT,
-                 smooth_win=SMOOTH_WIN, cnn_weight=None):
+                 smooth_win=SMOOTH_WIN, cnn_weight=None, glasses_mode=None):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.use_yolo = use_yolo
         self.yolo_interval = yolo_interval
@@ -83,6 +85,10 @@ class DrowsinessDetector:
         self.smooth_win = smooth_win
         self.beep_alerts = True
         self._prev_drowsy = False
+        # glasses_mode: None = auto-detect every frame; 0/1 = force the
+        # no-glasses / glasses eye model once (chosen at startup), skipping the
+        # per-frame glasses re-check entirely.
+        self.forced_glasses = glasses_mode
         # per-image mean/std normalisation makes the CNNs invariant to webcam
         # auto-exposure; the fine-tuned models are trained with this transform.
         self.standardize_crops = True
@@ -97,6 +103,14 @@ class DrowsinessDetector:
         # 2) trained CNNs (real fine-tuned weights take priority over synthetic)
         self.eye_net = self._load_cnn(EYE_WEIGHTS_REAL if os.path.exists(EYE_WEIGHTS_REAL)
                                       else EYE_WEIGHTS)
+        # glasses-specific eye model + a glasses-vs-no-glasses classifier.
+        # When both exist the detector routes the eye crop to the matching
+        # model, so neither appearance's weights are diluted by the other.
+        self.eye_net_glasses = self._load_cnn(EYE_WEIGHTS_GLASSES) \
+            if os.path.exists(EYE_WEIGHTS_GLASSES) else None
+        self.glasses_net = self._load_cnn(GLASSES_WEIGHTS) \
+            if os.path.exists(GLASSES_WEIGHTS) else None
+        self.glasses_ok = self.glasses_net is not None and self.eye_net_glasses is not None
         self.mouth_net = self._load_cnn(MOUTH_WEIGHTS_REAL if os.path.exists(MOUTH_WEIGHTS_REAL)
                                         else MOUTH_WEIGHTS)
         self.using_real_model = os.path.exists(EYE_WEIGHTS_REAL)
@@ -128,6 +142,8 @@ class DrowsinessDetector:
         self._yawn_run = 0
         self._eye_hist = []
         self._mouth_hist = []
+        self._glasses_hist = []
+        self.glasses_now = 0
         self._last_face = None
         self._dbg_frame = None
         self._last_mouth_contrast = None
@@ -161,6 +177,13 @@ class DrowsinessDetector:
         with torch.no_grad():
             prob = torch.softmax(net(x), 1)[0]
         return prob.cpu().numpy()
+
+    def _glasses_probs(self, crop_bgr):
+        """P(glasses) from the glasses-vs-no-glasses CNN (or None if absent)."""
+        if crop_bgr is None or crop_bgr.size == 0 or self.glasses_net is None:
+            return None
+        prob = self._cnn_probs(self.glasses_net, crop_bgr)
+        return None if prob is None else float(prob[1])
 
     def _predict(self, net, crop_bgr, kind):
         """Resize + normalise a BGR crop and run the binary CNN.
@@ -282,8 +305,24 @@ class DrowsinessDetector:
             mx, mw = fx + int(fw * 0.22), int(fw * 0.56)
             mouth = frame_bgr[my1:my2, mx:mx + mw]
 
-            eL, eLc = self._predict(self.eye_net, left_eye, "eye")
-            eR, eRc = self._predict(self.eye_net, right_eye, "eye")
+            # glasses state: fixed at startup (no re-check) or auto-detected
+            # every frame via the glasses-vs-no-glasses classifier
+            if self.forced_glasses is not None:
+                self.glasses_now = 1 if self.forced_glasses else 0
+            else:
+                gp_l = self._glasses_probs(left_eye)
+                gp_r = self._glasses_probs(right_eye)
+                if gp_l is not None and gp_r is not None:
+                    gp = 0.5 * (gp_l + gp_r)
+                    self._glasses_hist.append(1 if gp >= 0.5 else 0)
+                    if len(self._glasses_hist) > max(2 * self.smooth_win, 5):
+                        self._glasses_hist.pop(0)
+                    self.glasses_now = 1 if sum(self._glasses_hist) > len(self._glasses_hist) // 2 \
+                        else 0
+            eye_net = self.eye_net_glasses if (self.glasses_now and self.eye_net_glasses is not None) \
+                else self.eye_net
+            eL, eLc = self._predict(eye_net, left_eye, "eye")
+            eR, eRc = self._predict(eye_net, right_eye, "eye")
             mS, mSc = self._predict(self.mouth_net, mouth, "mouth")
             status["eye_left"] = "closed" if eL == 1 else "open"
             status["eye_right"] = "closed" if eR == 1 else "open"
@@ -292,6 +331,7 @@ class DrowsinessDetector:
             # diagnostics (used by the tuning script; no effect on behaviour)
             self._dbg_frame = {
                 "frame": self.frame_idx,
+                "glasses": self.glasses_now if self.glasses_ok else None,
                 "eL": eL, "eR": eR, "mS": mS,
                 "eLc": float(eLc) if eLc is not None else None,
                 "eRc": float(eRc) if eRc is not None else None,
@@ -331,12 +371,27 @@ class DrowsinessDetector:
                         (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
             cv2.putText(frame_bgr, f"mouth: {status['mouth']}", (10, 48),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            if self.glasses_ok:
+                tag = " (fixed)" if self.forced_glasses is not None else ""
+                cv2.putText(frame_bgr, f"glasses: {'yes' if self.glasses_now else 'no'}{tag}",
+                            (10, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
         else:
-            # no face detected - nothing to classify this frame
+            # no face in the frame -> make NO prediction at all: eye/mouth stay
+            # None, the alert reports NO FACE, and any in-progress drowsy/yawn
+            # counters are reset so a freshly-detected face cannot alarm on a
+            # stale streak.
             status["driver_present"] = yolo_person
+            status["alert"] = "NO FACE"
+            self._reset_runs()
+            self._eye_hist.clear()
+            self._mouth_hist.clear()
+            self._dbg_frame = None
 
-        # ---- 3) final alert level
-        if status["drowsy"]:
+        # ---- 3) final alert level (NO FACE already set above; never predict
+        # a state for a frame that had no face)
+        if status["alert"] == "NO FACE":
+            pass
+        elif status["drowsy"]:
             status["alert"] = "DROWSY"
         elif status["yawning"]:
             status["alert"] = "YAWNING"
@@ -350,7 +405,7 @@ class DrowsinessDetector:
         h, w = frame_bgr.shape[:2]
         txt = status["alert"]
         color = {"SAFE": (0, 255, 0), "DROWSY": (0, 0, 255),
-                 "YAWNING": (0, 165, 255)}[txt]
+                 "YAWNING": (0, 165, 255), "NO FACE": (220, 220, 220)}[txt]
         cv2.rectangle(frame_bgr, (w // 2 - 140, 12), (w // 2 + 140, 52), (0, 0, 0), -1)
         cv2.putText(frame_bgr, f"STATE: {txt}", (w // 2 - 110, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
