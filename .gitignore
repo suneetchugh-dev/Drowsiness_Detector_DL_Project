@@ -1,0 +1,35 @@
+# ---- Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---- Jupyter ----------------------------------------------------------------
+.ipynb_checkpoints/
+
+# ---- logs -------------------------------------------------------------------
+*.log
+
+# ---- personal captures of YOUR face (never push these) ----------------------
+data/calibration/
+_calibration_backup/
+_calibration_backup_v2/
+_calibration_backup_v3/
+_live_crops/
+
+# ---- recorded / generated media ----------------------------------------------
+demo/
+samples/
+outputs/
+
+# ---- data (all regenerable or downloadable, huge) ----------------------------
+# synthetic set (generate_data.py), calibration, MRL Eye Dataset (84,898 PNGs)
+data/
+
+# ---- OS / editors ------------------------------------------------------------
+Thumbs.db
+.DS_Store
+.idea/
+.vscode/
