@@ -37,8 +37,6 @@ IMG_SIZE = 48
 # ---- tuned alert thresholds -------------------------------------------------
 CLOSED_FRAMES_ALERT = 3     # consecutive frames both eyes closed -> DROWSY
 YAWN_FRAMES_ALERT = 2       # consecutive frames yawning           -> YAWNING
-DISTRACT_FRAMES_ALERT = 6   # consecutive frames no face           -> DISTRACTED
-CENTER_MARGIN = 0.20        # face must stay within this band of the frame centre
 SMOOTH_WIN = 5              # majority-vote window for eye/mouth states
 MOUTH_OPEN_CONTRAST = 18.0  # band std below which the mouth is considered CLOSED
                             # (cal crops: yawn median 20.4, no_yawn median 16.1)
@@ -76,18 +74,18 @@ class DrowsinessDetector:
 
     def __init__(self, device=None, use_yolo=True, yolo_interval=3,
                  closed_frames=CLOSED_FRAMES_ALERT, yawn_frames=YAWN_FRAMES_ALERT,
-                 distract_frames=DISTRACT_FRAMES_ALERT, center_margin=CENTER_MARGIN,
                  smooth_win=SMOOTH_WIN, cnn_weight=None):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.use_yolo = use_yolo
         self.yolo_interval = yolo_interval
         self.closed_frames = closed_frames
         self.yawn_frames = yawn_frames
-        self.distract_frames = distract_frames
-        self.center_margin = center_margin
         self.smooth_win = smooth_win
         self.beep_alerts = True
         self._prev_drowsy = False
+        # per-image mean/std normalisation makes the CNNs invariant to webcam
+        # auto-exposure; the fine-tuned models are trained with this transform.
+        self.standardize_crops = True
 
         # 1) Haar cascades shipped with opencv-python
         cascade_dir = cv2.data.haarcascades
@@ -128,10 +126,11 @@ class DrowsinessDetector:
         self.frame_idx = 0
         self._closed_run = 0
         self._yawn_run = 0
-        self._no_face_run = 0
         self._eye_hist = []
         self._mouth_hist = []
         self._last_face = None
+        self._dbg_frame = None
+        self._last_mouth_contrast = None
 
     # ------------------------------------------------------------------ setup
     def _load_cnn(self, path):
@@ -144,12 +143,20 @@ class DrowsinessDetector:
         return net
 
     def _cnn_probs(self, net, crop_bgr):
-        """Raw softmax probabilities [p_open, p_closed] / [p_no_yawn, p_yawn]."""
+        """Raw softmax probabilities [p_open, p_closed] / [p_no_yawn, p_yawn].
+
+        Crops are per-image standardised (subtract mean, divide by std) before
+        the CNN. This makes the network invariant to webcam auto-exposure /
+        lighting changes (live crops measured ~3x brighter than calibration),
+        which caused open eyes to be read as closed in live light."""
         if crop_bgr is None or crop_bgr.size == 0 or net is None:
             return None
         img = cv2.resize(crop_bgr, (IMG_SIZE, IMG_SIZE))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        img = (img - 0.5) / 0.5
+        if self.standardize_crops:
+            img = (img - img.mean()) / (img.std() + 1e-6)
+        else:
+            img = (img - 0.5) / 0.5
         x = torch.from_numpy(img.transpose(2, 0, 1)).unsqueeze(0).to(self.device)
         with torch.no_grad():
             prob = torch.softmax(net(x), 1)[0]
@@ -180,6 +187,7 @@ class DrowsinessDetector:
             band = gray[int(gray.shape[0] * 0.25):int(gray.shape[0] * 0.75), :]
             contrast = float(band.std())
             is_open = contrast >= MOUTH_OPEN_CONTRAST
+            self._last_mouth_contrast = contrast
             return (1 if (is_open and prob[1] >= 0.5) else 0), float(prob[1])
 
         gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
@@ -211,7 +219,6 @@ class DrowsinessDetector:
     def _reset_runs(self):
         self._closed_run = 0
         self._yawn_run = 0
-        self._no_face_run = 0
 
     # -------------------------------------------------------------- main pass
     def process_frame(self, frame_bgr):
@@ -223,7 +230,7 @@ class DrowsinessDetector:
         status = {
             "driver_present": False, "face": False,
             "eye_left": None, "eye_right": None, "mouth": None,
-            "drowsy": False, "yawning": False, "distracted": False,
+            "drowsy": False, "yawning": False,
             "alert": "SAFE",
         }
 
@@ -261,7 +268,6 @@ class DrowsinessDetector:
             fx, fy, fw, fh = face
             status["face"] = True
             status["driver_present"] = True
-            self._no_face_run = 0
 
             # geometric eye strip (upper ~45% of the face)
             eye_strip_y1 = fy + int(fh * 0.15)
@@ -283,6 +289,17 @@ class DrowsinessDetector:
             status["eye_right"] = "closed" if eR == 1 else "open"
             status["mouth"] = "yawn" if mS == 1 else "no_yawn"
 
+            # diagnostics (used by the tuning script; no effect on behaviour)
+            self._dbg_frame = {
+                "frame": self.frame_idx,
+                "eL": eL, "eR": eR, "mS": mS,
+                "eLc": float(eLc) if eLc is not None else None,
+                "eRc": float(eRc) if eRc is not None else None,
+                "mSc": float(mSc) if mSc is not None else None,
+                "mouth_contrast": getattr(self, "_last_mouth_contrast", None),
+                "closed_run": self._closed_run, "yawn_run": self._yawn_run,
+            }
+
             # temporal smoothing via majority vote (drowsy requires BOTH eyes
             # closed - a single misclassified/blinking eye must not alarm)
             self._eye_hist.append(1 if (eL == 1 and eR == 1) else 0)
@@ -297,11 +314,6 @@ class DrowsinessDetector:
             self._closed_run = self._closed_run + 1 if closed_now else 0
             self._yawn_run = self._yawn_run + 1 if yawn_now else 0
 
-            # distraction: face drifted outside the centre band
-            face_cx = fx + fw / 2
-            if not (w * self.center_margin < face_cx < w * (1 - self.center_margin)):
-                status["distracted"] = True
-
             # draw overlays
             color = (0, 255, 0)
             if self._closed_run >= self.closed_frames:
@@ -309,8 +321,6 @@ class DrowsinessDetector:
                 color = (0, 0, 255)
             elif self._yawn_run >= self.yawn_frames:
                 status["yawning"] = True
-                color = (0, 165, 255)
-            elif status["distracted"]:
                 color = (0, 165, 255)
 
             cv2.rectangle(frame_bgr, (fx, fy), (fx + fw, fy + fh), color, 2)
@@ -322,19 +332,14 @@ class DrowsinessDetector:
             cv2.putText(frame_bgr, f"mouth: {status['mouth']}", (10, 48),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
         else:
-            # no face detected -> driver may be looking away / not present
-            self._no_face_run += 1
+            # no face detected - nothing to classify this frame
             status["driver_present"] = yolo_person
-            if self._no_face_run >= self.distract_frames:
-                status["distracted"] = True
 
         # ---- 3) final alert level
         if status["drowsy"]:
             status["alert"] = "DROWSY"
         elif status["yawning"]:
             status["alert"] = "YAWNING"
-        elif status["distracted"]:
-            status["alert"] = "DISTRACTED"
         else:
             status["alert"] = "SAFE"
 
@@ -345,13 +350,10 @@ class DrowsinessDetector:
         h, w = frame_bgr.shape[:2]
         txt = status["alert"]
         color = {"SAFE": (0, 255, 0), "DROWSY": (0, 0, 255),
-                 "YAWNING": (0, 165, 255), "DISTRACTED": (0, 165, 255)}[txt]
+                 "YAWNING": (0, 165, 255)}[txt]
         cv2.rectangle(frame_bgr, (w // 2 - 140, 12), (w // 2 + 140, 52), (0, 0, 0), -1)
         cv2.putText(frame_bgr, f"STATE: {txt}", (w // 2 - 110, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-        if status["distracted"] and not status["drowsy"] and not status["yawning"]:
-            cv2.putText(frame_bgr, "Driver not looking at the road!",
-                        (10, h - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 165, 255), 1)
         if winsound is not None and self.beep_alerts and status["drowsy"] \
                 and not self._prev_drowsy:
             winsound.Beep(900, 250)
@@ -390,15 +392,14 @@ def detect_video(detector, video_path, output_path=None, show=False, max_frames=
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         out = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
 
-    stats = {"frames": 0, "drowsy": 0, "yawn": 0, "distracted": 0}
+    stats = {"frames": 0, "drowsy": 0, "yawn": 0}
     while True:
         ok, frame = cap.read()
         if not ok:
             break
         frame, status = detector.process_frame(frame)
         stats["frames"] += 1
-        for key, status_key in (("drowsy", "drowsy"), ("yawn", "yawning"),
-                                ("distracted", "distracted")):
+        for key, status_key in (("drowsy", "drowsy"), ("yawn", "yawning")):
             if status.get(status_key):
                 stats[key] += 1
         if out is not None:
@@ -429,7 +430,7 @@ def detect_webcam(detector, camera=0):
         if not ok:
             break
         frame, status = detector.process_frame(frame)
-        cv2.imshow("Driver Drowsiness & Distraction Detection", frame)
+        cv2.imshow("Driver Drowsiness Detection", frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
     cap.release()

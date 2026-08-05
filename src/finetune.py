@@ -21,11 +21,12 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torchvision.transforms as T
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
-from train import (ImageFolderDS, build_dfs, TRAIN_TFM, VAL_TFM, SmallCNN,
+from train import (ImageFolderDS, build_dfs, SmallCNN,
                    train_one, evaluate, DEVICE, BATCH_SIZE, LR)
 
 CAL_ROOT = "data/calibration"
@@ -33,6 +34,29 @@ REPEAT_REAL = 4          # repeats of each real crop inside the training set
 FINETUNE_EPOCHS = 8
 FINETUNE_LR = 2e-4
 WEIGHT_DECAY = 1e-4
+
+
+def _standardize(t):
+    """Per-image mean/std normalisation - matches detector._cnn_probs so the
+    CNNs are invariant to webcam auto-exposure / lighting changes."""
+    return (t - t.mean()) / (t.std() + 1e-6)
+
+
+# augmented training: jitter first, then standardise so the network must
+# ignore global brightness/contrast when separating the classes
+FT_TRAIN_TFM = T.Compose([
+    T.ToTensor(),
+    T.Resize((48, 48)),
+    T.RandomRotation(8),
+    T.RandomAffine(0, translate=(0.05, 0.05)),
+    T.RandomApply([T.ColorJitter(brightness=0.3, contrast=0.3)], p=0.5),
+    T.Lambda(_standardize),
+])
+FT_VAL_TFM = T.Compose([
+    T.ToTensor(),
+    T.Resize((48, 48)),
+    T.Lambda(_standardize),
+])
 
 
 def make_cal_df(kind):
@@ -73,8 +97,8 @@ def finetune(kind, out_path, pretrained_path):
     mixed = pd.concat([synth_train, cal_train], ignore_index=True).sample(frac=1, random_state=42)
     mixed.reset_index(drop=True, inplace=True)
 
-    train_ds = ImageFolderDS(mixed, transform=TRAIN_TFM)
-    val_ds = ImageFolderDS(cal_val, transform=VAL_TFM)
+    train_ds = ImageFolderDS(mixed, transform=FT_TRAIN_TFM)
+    val_ds = ImageFolderDS(cal_val, transform=FT_VAL_TFM)
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 

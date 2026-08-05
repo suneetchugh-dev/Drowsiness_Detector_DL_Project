@@ -1,4 +1,4 @@
-"""Tkinter launcher for the Drowsiness & Distraction Detection system.
+"""Tkinter launcher for the Driver Drowsiness Detection system.
 
 Three modes: live webcam, upload a video, upload an image.
 """
@@ -24,11 +24,11 @@ class DrowsinessApp:
         self.det = DrowsinessDetector(use_yolo=False)
         self.q = queue.Queue()
 
-        root.title("Driver Drowsiness & Distraction Detection")
+        root.title("Driver Drowsiness Detection")
         root.geometry("560x420")
         root.resizable(False, False)
 
-        title = tk.Label(root, text="Driver Drowsiness & Distraction Detection",
+        title = tk.Label(root, text="Driver Drowsiness Detection",
                          font=("Segoe UI", 14, "bold"))
         title.pack(pady=12)
 
@@ -115,7 +115,7 @@ class DrowsinessApp:
     def _run_video(self, path, out):
         stats = detect_video(self.det, path, out)
         msg = f"Video done: {stats['frames']} frames | drowsy={stats['drowsy']} " \
-              f"| yawn={stats['yawn']} | distracted={stats['distracted']}"
+              f"| yawn={stats['yawn']}"
         self._log(msg)
         self.q.put(("status", f"Saved annotated video -> {out}"))
         self.q.put(("log", "opening result ..."))
