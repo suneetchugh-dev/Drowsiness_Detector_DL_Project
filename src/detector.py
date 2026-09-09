@@ -473,21 +473,44 @@ def detect_video(detector, video_path, output_path=None, show=False, max_frames=
     return stats
 
 
-def detect_webcam(detector, camera=0):
-    """Live webcam loop. Press 'q' to quit."""
+def detect_webcam(detector, camera=0, fullscreen=False, window_name="Driver Drowsiness Detection"):
+    """Live webcam loop. Press 'q' to quit.
+
+    The window is resizable (WINDOW_NORMAL) by default; pass fullscreen=True
+    to open maximised. Keys:
+      q / ESC  -> quit
+      f        -> toggle fullscreen
+    """
     detector.beep_alerts = True
     cap = cv2.VideoCapture(camera)
     if not cap.isOpened():
         raise RuntimeError("webcam not available")
-    print("live detection started - press 'q' to quit")
+
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    if fullscreen:
+        cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN,
+                              cv2.WINDOW_FULLSCREEN)
+    else:
+        try:
+            cv2.resizeWindow(window_name, 960, 640)
+        except cv2.error:
+            pass
+
+    print("live detection started - press 'q' to quit, 'f' to toggle fullscreen")
     while True:
         ok, frame = cap.read()
         if not ok:
             break
         frame, status = detector.process_frame(frame)
-        cv2.imshow("Driver Drowsiness Detection", frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
+        cv2.imshow(window_name, frame)
+        key = cv2.waitKey(1) & 0xFF
+        if key in (ord("q"), 27):
             break
+        if key == ord("f"):
+            prop = cv2.WINDOW_FULLSCREEN if cv2.getWindowProperty(
+                window_name, cv2.WND_PROP_FULLSCREEN) != cv2.WINDOW_FULLSCREEN \
+                else cv2.WINDOW_NORMAL
+            cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, prop)
     cap.release()
     cv2.destroyAllWindows()
 
