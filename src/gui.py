@@ -23,6 +23,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from tkinter import font as tkfont
 from PIL import Image, ImageTk
 import cv2
 
@@ -221,35 +222,111 @@ class SegmentedControl(tk.Frame):
         return self._variable.get()
 
 
-class FlatButton(tk.Button):
-    """Uniform modern flat button (tk.Button so styling is fully controlled)."""
+class FlatButton(tk.Canvas):
+    """Modern rounded pill button with a hover highlight.
 
-    def __init__(self, master, text, command=None, accent=False, width=None,
-                 **kwargs):
-        super().__init__(
-            master, text=text, font=APP_FONT_BOLD,
-            relief="flat", borderwidth=0, bd=0,
-            padx=16, pady=9, cursor="hand2",
-            highlightthickness=0,
-            bg=MonochromeTheme.ACCENT if accent else MonochromeTheme.FIELD_BG,
-            fg=MonochromeTheme.WHITE if accent else MonochromeTheme.FG,
-            activebackground=(MonochromeTheme.ACCENT_ACTIVE
-                              if accent else MonochromeTheme.SEL_BG),
-            activeforeground=MonochromeTheme.WHITE if accent else MonochromeTheme.FG,
-            disabledforeground=MonochromeTheme.DISABLED_FG,
-            command=command,
-        )
-        if width:
-            self.configure(width=width)
+    tk.Button cannot draw rounded corners, so buttons are rendered on a canvas:
+    a rounded rectangle blends against the parent background (the canvas bg is
+    set to the container's bg) and brightens on hover. The public API mirrors
+    the original tk.Button-based FlatButton (text / state / command / accent)."""
 
+    HEIGHT = 38
+    RADIUS = 12
+
+    def __init__(self, master, text="", command=None, accent=False, width=None,
+                 bg=None, font=APP_FONT_BOLD, **kwargs):
+        kwargs.setdefault("highlightthickness", 0)
+        kwargs.setdefault("relief", "flat")
+        kwargs.setdefault("cursor", "hand2")
+        self._canvas_bg = bg or MonochromeTheme.BG
+        super().__init__(master, bg=self._canvas_bg, **kwargs)
+        self._text = str(text)
+        self._command = command
+        self._accent = accent
+        self._disabled = False
+        self._hover = False
+        self._width = width
+        self._font = font
+        measure = tkfont.Font(font=font).measure(self._text)
+        super().configure(width=max(self._width or 0, measure + 44, 90),
+                          height=FlatButton.HEIGHT)
+        self.bind("<Configure>", lambda e: self._redraw())
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<Button-1>", self._on_click)
+
+    # -------------------------------------------------------- public API
     def set_accent(self, accent):
-        self.configure(
-            bg=MonochromeTheme.ACCENT if accent else MonochromeTheme.FIELD_BG,
-            fg=MonochromeTheme.WHITE if accent else MonochromeTheme.FG,
-            activebackground=(MonochromeTheme.ACCENT_ACTIVE
-                              if accent else MonochromeTheme.SEL_BG),
-            activeforeground=(MonochromeTheme.WHITE if accent
-                              else MonochromeTheme.FG))
+        self._accent = accent
+        self._redraw()
+
+    def configure(self, cnf=None, **kw):
+        if cnf:
+            kw.update(cnf)
+        for key, val in list(kw.items()):
+            if key == "text":
+                self._text = str(val)
+                if not self._width:
+                    measure = tkfont.Font(font=self._font).measure(self._text)
+                    super().configure(width=max(measure + 44, 90))
+            elif key == "command":
+                self._command = val
+            elif key == "state":
+                self._disabled = val == "disabled"
+                self._hover = False
+            elif key == "accent":
+                self._accent = val
+            elif key == "bg":
+                self._canvas_bg = val
+                super().configure(bg=val)
+        self._redraw()
+        return []
+
+    config = configure
+
+    # --------------------------------------------------------- handlers
+    def _on_enter(self, _event=None):
+        if not self._disabled:
+            self._hover = True
+            self._redraw()
+
+    def _on_leave(self, _event=None):
+        self._hover = False
+        self._redraw()
+
+    def _on_click(self, _event=None):
+        if self._disabled or self._command is None:
+            return
+        self._command()
+
+    # ------------------------------------------------------- rendering
+    def _redraw(self):
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 8 or h < 8:
+            return
+        pad = 2
+        if self._disabled:
+            fill, fg = MonochromeTheme.FIELD_BG, MonochromeTheme.DISABLED_FG
+        elif self._hover:
+            if self._accent:
+                fill, fg = MonochromeTheme.ACCENT_ACTIVE, MonochromeTheme.WHITE
+            else:
+                fill, fg = MonochromeTheme.SEL_BG, MonochromeTheme.FG
+        elif self._accent:
+            fill, fg = MonochromeTheme.ACCENT, MonochromeTheme.WHITE
+        else:
+            fill, fg = MonochromeTheme.FIELD_BG, MonochromeTheme.FG
+        radius = max(2, min(FlatButton.RADIUS, (h - 2 * pad) / 2.0))
+        self._rounded(pad, pad, w - pad, h - pad, radius, fill=fill, outline=fill)
+        self.create_text(w / 2.0, h / 2.0, text=self._text,
+                         font=self._font, fill=fg)
+
+    def _rounded(self, x1, y1, x2, y2, r, **kw):
+        pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
+               x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
+               x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+        self.create_polygon(pts, smooth=True, **kw)
 
 
 def _powershell(args):
@@ -289,9 +366,18 @@ class DrowsinessApp:
     def __init__(self, root, glasses_mode=None):
         self.root = root
         self.root.title("Driver Drowsiness Detection")
-        self.root.geometry("720x760")
+        self.root.geometry("1024x768")
         self.root.minsize(680, 720)
         self.root.configure(bg=MonochromeTheme.BG)
+
+        # Default opening mode: Fullscreen Windowed (Maximized)
+        try:
+            self.root.state("zoomed")
+        except Exception:
+            try:
+                self.root.attributes("-zoomed", True)
+            except Exception:
+                pass
 
         self.force_glasses = glasses_mode
         self.glasses_var = tk.StringVar(value=self._glasses_default())
@@ -344,49 +430,48 @@ class DrowsinessApp:
 
         tk.Label(body, text="Eye glasses model",
                  font=APP_FONT_BOLD, fg=MonochromeTheme.FG,
-                 bg=MonochromeTheme.SURFACE).pack(anchor="w", pady=(0, 8))
+                 bg=MonochromeTheme.SURFACE).pack(anchor="w", pady=(0, 6))
 
-        row = tk.Frame(body, bg=MonochromeTheme.SURFACE)
-        row.pack(fill="x")
+        row1 = tk.Frame(body, bg=MonochromeTheme.SURFACE)
+        row1.pack(fill="x", pady=(0, 10))
 
-        self.btn_glasses = FlatButton(row, self._glasses_button_text(),
-                                      command=self._toggle_glasses)
-        self.btn_glasses.pack(side="left", fill="x", expand=True)
+        self.btn_glasses = FlatButton(row1, self._glasses_button_text(),
+                                      command=self._toggle_glasses,
+                                      width=190, bg=MonochromeTheme.SURFACE)
+        self.btn_glasses.pack(side="left")
 
-        tk.Label(row, text="  Tap to switch. Auto detects each frame; "
-                           "On / Off fix the model at startup.",
-                 font=("Segoe UI", 9), fg=MonochromeTheme.MUTED,
-                 bg=MonochromeTheme.SURFACE).pack(side="left")
+        tk.Label(row1, text="Tap to switch. Auto detects each frame;\n"
+                            "On / Off fix the model at runtime without restarting.",
+                 font=("Segoe UI", 9), fg=MonochromeTheme.MUTED, justify="left",
+                 bg=MonochromeTheme.SURFACE).pack(side="left", padx=(14, 0))
 
-        ttk.Separator(body, orient="horizontal").pack(fill="x", pady=(12, 12))
+        ttk.Separator(body, orient="horizontal").pack(fill="x", pady=(4, 10))
 
         tk.Label(body, text="Screen visibility light",
                  font=APP_FONT_BOLD, fg=MonochromeTheme.FG,
-                 bg=MonochromeTheme.SURFACE).pack(anchor="w", pady=(0, 8))
+                 bg=MonochromeTheme.SURFACE).pack(anchor="w", pady=(0, 6))
 
         row2 = tk.Frame(body, bg=MonochromeTheme.SURFACE)
-        row2.pack(fill="x")
+        row2.pack(fill="x", pady=(0, 4))
 
         self.btn_flash_mode = FlatButton(row2, self._flash_button_text(),
-                                         command=self._toggle_flash)
-        self.btn_flash_mode.pack(side="left", fill="x", expand=True)
+                                         command=self._toggle_flash,
+                                         width=190, bg=MonochromeTheme.SURFACE)
+        self.btn_flash_mode.pack(side="left")
 
-        tk.Label(row2, text="  Max screen brightness as a fill light. "
-                            "Auto boosts only in low light.",
-                 font=("Segoe UI", 9), fg=MonochromeTheme.MUTED,
-                 bg=MonochromeTheme.SURFACE).pack(side="left")
+        tk.Label(row2, text="Max screen brightness as a fill light.\n"
+                            "Auto boosts only in low light conditions.",
+                 font=("Segoe UI", 9), fg=MonochromeTheme.MUTED, justify="left",
+                 bg=MonochromeTheme.SURFACE).pack(side="left", padx=(14, 0))
 
     # ---------------------------------------------------------- glasses
     def _glasses_button_text(self):
         return "Eye glasses: %s" % self.glasses_var.get().capitalize()
 
     def _toggle_glasses(self):
-        if self.glasses_var.get() == "auto":
-            self.glasses_var.set("on")
-        elif self.glasses_var.get() == "on":
-            self.glasses_var.set("off")
-        else:
-            self.glasses_var.set("auto")
+        cur = self.glasses_var.get()
+        nxt = {"auto": "on", "on": "off", "off": "auto"}.get(cur, "auto")
+        self.glasses_var.set(nxt)
         self.btn_glasses.configure(text=self._glasses_button_text())
         self._on_glasses_change()
 
@@ -425,19 +510,36 @@ class DrowsinessApp:
         grid = tk.Frame(actions, bg=MonochromeTheme.BG)
         grid.pack(fill="x")
 
-        self.btn_webcam = FlatButton(grid, "Live Webcam", command=self.start_webcam,
+        self.btn_webcam = FlatButton(grid, "Live Webcam", command=lambda: self._select_mode("webcam"),
                                      accent=True)
         self.btn_webcam.grid(row=0, column=0, sticky="ew", padx=(0, 6))
 
-        self.btn_video = FlatButton(grid, "Upload Video", command=self.start_video)
+        self.btn_video = FlatButton(grid, "Upload Video", command=lambda: self._select_mode("video"))
         self.btn_video.grid(row=0, column=1, sticky="ew", padx=(6, 6))
 
-        self.btn_image = FlatButton(grid, "Upload Image", command=self.start_image)
+        self.btn_image = FlatButton(grid, "Upload Image", command=lambda: self._select_mode("image"))
         self.btn_image.grid(row=0, column=2, sticky="ew", padx=(6, 0))
 
         grid.columnconfigure(0, weight=1)
         grid.columnconfigure(1, weight=1)
         grid.columnconfigure(2, weight=1)
+
+    def _select_mode(self, mode):
+        self.btn_webcam.set_accent(mode == "webcam")
+        self.btn_video.set_accent(mode == "video")
+        self.btn_image.set_accent(mode == "image")
+
+        if mode == "webcam":
+            if not self._feed_open:
+                self.start_webcam()
+        elif mode == "video":
+            if self._feed_open:
+                self.stop_webcam(silent=True)
+            self.start_video()
+        elif mode == "image":
+            if self._feed_open:
+                self.stop_webcam(silent=True)
+            self.start_image()
 
     # -------------------------------------------------------- feed panel
     def _build_feed_panel(self):
@@ -451,10 +553,7 @@ class DrowsinessApp:
 
         view_controls = tk.Frame(head, bg=MonochromeTheme.BG)
         view_controls.pack(side="right")
-        self.btn_flash = FlatButton(view_controls, "Screen Flash",
-                                    command=self.screen_flash)
-        self.btn_flash.pack(side="left", padx=(0, 4))
-        self.btn_view = FlatButton(view_controls, "Fullscreen",
+        self.btn_view = FlatButton(view_controls, "⛶  Fullscreen",
                                    command=self.toggle_fullscreen)
         self.btn_view.pack(side="left")
 
@@ -468,8 +567,9 @@ class DrowsinessApp:
         self.feed_label.pack(fill="both", expand=True)
 
         self.btn_stop = FlatButton(self.feed, "Start Detection",
-                                   command=self.toggle_webcam)
-        self.btn_stop.configure(state="disabled")
+                                   command=self.toggle_webcam,
+                                   bg=MonochromeTheme.FEED_BG)
+        self.btn_stop.configure(state="normal")
         self.btn_stop.place(relx=1.0, rely=0.0, anchor="ne", x=-12, y=12)
 
         self.panel.bind("<Configure>", self._on_feed_resize)
@@ -482,13 +582,17 @@ class DrowsinessApp:
         if mode == "fullscreen":
             self._fullscreen = True
             self.root.attributes("-fullscreen", True)
-            self.btn_view.configure(text="Exit Fullscreen",
+            self.btn_view.configure(text="🗗  Exit Fullscreen",
                                     state="normal")
             self.btn_view.set_accent(True)
         else:
             self._fullscreen = False
             self.root.attributes("-fullscreen", False)
-            self.btn_view.configure(text="Fullscreen", state="normal")
+            try:
+                self.root.state("zoomed")
+            except Exception:
+                pass
+            self.btn_view.configure(text="⛶  Fullscreen", state="normal")
             self.btn_view.set_accent(False)
 
     def _on_feed_resize(self, event):
@@ -570,16 +674,19 @@ class DrowsinessApp:
                 None: "Auto (per-frame)"}[mode]
 
     def _on_glasses_change(self):
-        if self.det is None:
-            return
-        if self._feed_open:
-            self.stop_webcam(silent=True)
         mode = self.glasses_var.get()
-        self.status.set("Reloading detector with glasses = %s ..." % mode, "busy")
-        self._set_actions_state("disabled")
-        self.det = None
-        threading.Thread(target=self._load_detector, args=(mode,),
-                         daemon=True).start()
+        glasses_mode = GLASSES_MODE[mode]
+        self.force_glasses = glasses_mode
+        if self.det is not None:
+            self.det.forced_glasses = glasses_mode
+            lbl = self._glasses_label(glasses_mode)
+            self._set_status(f"Eye glasses model: {lbl}", "ok")
+            self._log(f"glasses mode switched to {mode} ({lbl})", kind="info")
+        else:
+            self.status.set("Reloading detector with glasses = %s ..." % mode, "busy")
+            self._set_actions_state("disabled")
+            threading.Thread(target=self._load_detector, args=(mode,),
+                             daemon=True).start()
 
     def _set_actions_state(self, state):
         for btn in (self.btn_webcam, self.btn_video, self.btn_image):
@@ -656,7 +763,6 @@ class DrowsinessApp:
         self._set_actions_state("disabled")
         self._set_stop_button("Stop Detection", "normal")
         self.btn_webcam.set_accent(False)
-        self.btn_flash.configure(state="normal")
         self.feed_label.configure(text="Initialising camera ...",
                                   fg=MonochromeTheme.MUTED,
                                   font=("Segoe UI", 11))
@@ -668,7 +774,6 @@ class DrowsinessApp:
             self._set_actions_state("normal")
             self._set_stop_button("Start Detection", "disabled")
             self.btn_webcam.set_accent(True)
-            self.btn_flash.configure(state="disabled")
             return
         self._feed_open = True
         self._cam_thread = threading.Thread(target=self._cam_loop, daemon=True)
@@ -801,7 +906,6 @@ class DrowsinessApp:
         self._show_welcome()
         self._set_stop_button("Start Detection", "normal")
         self.btn_webcam.set_accent(True)
-        self.btn_flash.configure(state="disabled")
         self._restore_screen_brightness()
         self._set_actions_state("normal")
         self._set_status(msg, "ok")
@@ -876,6 +980,7 @@ def main(glasses_mode=None):
     root = tk.Tk()
     app = DrowsinessApp(root, glasses_mode=glasses_mode)
     root.bind("<Escape>", lambda e: app.set_view("windowed"))
+    root.bind("<F11>", lambda e: app.toggle_fullscreen())
     root.protocol("WM_DELETE_WINDOW", app.on_close)
     root.mainloop()
 

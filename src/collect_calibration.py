@@ -17,30 +17,18 @@ import os
 import time
 import cv2
 
-FACE_CASCADE = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+try:
+    from crops import detect_face, crop_regions, MIN_FACE
+except ImportError:
+    from src.crops import detect_face, crop_regions, MIN_FACE
 
 OUT = "data/calibration"
 DURATION = 3.0          # seconds per stage
 SAMPLE_EVERY = 0.12     # seconds between saved crops
-MIN_FACE = 90
-
-
-def crop_regions(frame, face):
-    fx, fy, fw, fh = face
-    y1, y2 = fy + int(fh * 0.15), fy + int(fh * 0.55)
-    lx, lw = fx + int(fw * 0.05), int(fw * 0.42)
-    rx = fx + int(fw * 0.53)
-    left_eye = frame[y1:y2, lx:lx + lw]
-    right_eye = frame[y1:y2, rx:rx + lw]
-    my1, my2 = fy + int(fh * 0.55), fy + int(fh * 0.97)
-    mx, mw = fx + int(fw * 0.22), int(fw * 0.56)
-    mouth = frame[my1:my2, mx:mx + mw]
-    return left_eye, right_eye, mouth
 
 
 def collect(stage, instruction, count, face, glasses=False):
-    """Stage: 'eye_open' | 'eye_closed' | 'mouth_yawn' | 'mouth_no_yawn'.
+    """Stage: 'eye_open' | 'eye_tired' | 'eye_closed' | 'mouth_yawn' | 'mouth_no_yawn'.
 
     With glasses=True the saved crops get a '_g' suffix, which marks them as
     "captured with glasses" so finetune.py can train the glasses-specific eye
@@ -60,8 +48,8 @@ def collect(stage, instruction, count, face, glasses=False):
         if not ok:
             break
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = FACE_CASCADE.detectMultiScale(gray, 1.1, 5, minSize=(MIN_FACE, MIN_FACE))
-        f = faces[0] if len(faces) else face
+        detected = detect_face(gray)
+        f = detected if detected is not None else face
         fx, fy, fw, fh = f
         cv2.rectangle(frame, (fx, fy), (fx + fw, fy + fh), (0, 255, 0), 2)
         now = time.time()
@@ -128,9 +116,8 @@ def main():
         if not ok:
             continue
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = FACE_CASCADE.detectMultiScale(gray, 1.1, 5, minSize=(MIN_FACE, MIN_FACE))
-        if len(faces):
-            face = faces[0]
+        face = detect_face(gray)
+        if face is not None:
             break
     cap.release()
     if face is None:

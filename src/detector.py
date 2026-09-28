@@ -24,9 +24,16 @@ try:
 except ImportError:
     winsound = None
 
+try:
+    from crops import detect_face, localize_regions, crop_regions
+except ImportError:
+    from src.crops import detect_face, localize_regions, crop_regions
+
 MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
 
-EYE_WEIGHTS = os.path.join(MODEL_DIR, "eye_cnn.pth")
+EYE_WEIGHTS_MRL = os.path.join(MODEL_DIR, "eye_cnn_mrl.pth")
+EYE_WEIGHTS_SYNTH = os.path.join(MODEL_DIR, "eye_cnn.pth")
+EYE_WEIGHTS = EYE_WEIGHTS_MRL if os.path.exists(EYE_WEIGHTS_MRL) else EYE_WEIGHTS_SYNTH
 MOUTH_WEIGHTS = os.path.join(MODEL_DIR, "mouth_cnn.pth")
 EYE_WEIGHTS_REAL = os.path.join(MODEL_DIR, "eye_cnn_real.pth")
 EYE_WEIGHTS_GLASSES = os.path.join(MODEL_DIR, "eye_cnn_glasses.pth")
@@ -38,10 +45,20 @@ IMG_SIZE = 48
 
 # ---- tuned alert thresholds -------------------------------------------------
 CLOSED_FRAMES_ALERT = 3     # consecutive frames both eyes closed -> DROWSY
-YAWN_FRAMES_ALERT = 2       # consecutive frames yawning           -> YAWNING
+YAWN_FRAMES_ALERT = 4       # consecutive frames yawning           -> YAWNING
+TIRED_FRAMES_ALERT = 6      # consecutive frames of tired eyes      -> TIRED
 SMOOTH_WIN = 5              # majority-vote window for eye/mouth states
-MOUTH_OPEN_CONTRAST = 18.0  # band std below which the mouth is considered CLOSED
-                            # (cal crops: yawn median 20.4, no_yawn median 16.1)
+MOUTH_OPEN_CONTRAST = 18.0  # band std for telemetry / diagnostics
+MOUTH_YAWN_THRESH = 0.60    # CNN p(yawn) threshold (CNN-only gate)
+EYE_CLOSED_P = 0.34         # per-eye p_open below this -> eye CLOSED
+EYE_OPEN_P = 0.70           # per-eye p_open at/above this -> clearly OPEN
+                            # in-between the eye is TIRED (confidence band)
+STATE_HOLD_FRAMES = 12      # frames a candidate alert must persist before it is
+                            # committed (debounce, ~400ms at 30fps). Stops the
+                            # model from flickering between states when unsure.
+
+EYE_OPEN, EYE_TIRED, EYE_CLOSED = 0, 1, 2
+EYE_LABELS = {EYE_OPEN: "open", EYE_TIRED: "tired", EYE_CLOSED: "closed"}
 
 
 class SmallCNN(torch.nn.Module):
@@ -49,6 +66,7 @@ class SmallCNN(torch.nn.Module):
 
     def __init__(self, num_classes=2):
         super().__init__()
+        self.num_classes = num_classes
         self.features = torch.nn.Sequential(
             torch.nn.Conv2d(3, 32, 3, padding=1), torch.nn.BatchNorm2d(32), torch.nn.ReLU(),
             torch.nn.Conv2d(32, 32, 3, padding=1), torch.nn.ReLU(),
@@ -76,13 +94,18 @@ class DrowsinessDetector:
 
     def __init__(self, device=None, use_yolo=True, yolo_interval=3,
                  closed_frames=CLOSED_FRAMES_ALERT, yawn_frames=YAWN_FRAMES_ALERT,
-                 smooth_win=SMOOTH_WIN, cnn_weight=None, glasses_mode=None):
+                 tired_frames=TIRED_FRAMES_ALERT, smooth_win=SMOOTH_WIN,
+                 state_hold_frames=STATE_HOLD_FRAMES, mouth_yawn_thresh=MOUTH_YAWN_THRESH,
+                 cnn_weight=None, glasses_mode=None):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.use_yolo = use_yolo
         self.yolo_interval = yolo_interval
         self.closed_frames = closed_frames
         self.yawn_frames = yawn_frames
+        self.tired_frames = tired_frames
         self.smooth_win = smooth_win
+        self.state_hold_frames = state_hold_frames
+        self.mouth_yawn_thresh = mouth_yawn_thresh
         self.beep_alerts = True
         self._prev_drowsy = False
         # glasses_mode: None = auto-detect every frame; 0/1 = force the
@@ -90,7 +113,7 @@ class DrowsinessDetector:
         # per-frame glasses re-check entirely.
         self.forced_glasses = glasses_mode
         # per-image mean/std normalisation makes the CNNs invariant to webcam
-        # auto-exposure; the fine-tuned models are trained with this transform.
+        # auto-exposure.
         self.standardize_crops = True
 
         # 1) Haar cascades shipped with opencv-python
@@ -100,33 +123,20 @@ class DrowsinessDetector:
         self.eye_cascade = cv2.CascadeClassifier(
             os.path.join(cascade_dir, "haarcascade_eye.xml"))
 
-        # 2) trained CNNs (real fine-tuned weights take priority over synthetic)
-        self.eye_net = self._load_cnn(EYE_WEIGHTS_REAL if os.path.exists(EYE_WEIGHTS_REAL)
-                                      else EYE_WEIGHTS)
-        # glasses-specific eye model + a glasses-vs-no-glasses classifier.
-        # When both exist the detector routes the eye crop to the matching
-        # model, so neither appearance's weights are diluted by the other.
+        # 2) trained CNNs: primary base eye model is MRL Eye dataset (84,898 images)
+        self.eye_net = self._load_cnn(EYE_WEIGHTS)
         self.eye_net_glasses = self._load_cnn(EYE_WEIGHTS_GLASSES) \
             if os.path.exists(EYE_WEIGHTS_GLASSES) else None
         self.glasses_net = self._load_cnn(GLASSES_WEIGHTS) \
             if os.path.exists(GLASSES_WEIGHTS) else None
         self.glasses_ok = self.glasses_net is not None and self.eye_net_glasses is not None
-        self.mouth_net = self._load_cnn(MOUTH_WEIGHTS_REAL if os.path.exists(MOUTH_WEIGHTS_REAL)
-                                        else MOUTH_WEIGHTS)
-        self.using_real_model = os.path.exists(EYE_WEIGHTS_REAL)
-        # Fusion: each decision = cnn_weight * CNN + (1-cnn_weight) * heuristic.
-        # Thresholds/weights were tuned on the user's real calibration crops:
-        #   eye    CNN alone separates open/closed at ~0.88, pixel features only ~0.72
-        #   mouth  CNN ~0.83, contrast heuristic ~0.72
-        # so the fine-tuned CNN dominates, with the heuristic as a guard.
+        self.mouth_net = self._load_cnn(MOUTH_WEIGHTS)
+        self.using_real_model = False
         if cnn_weight is not None:
             self.eye_cnn_weight = self.mouth_cnn_weight = cnn_weight
-        elif self.using_real_model:
-            self.eye_cnn_weight = 0.60
-            self.mouth_cnn_weight = 0.70
         else:
-            # synthetic-only CNN has little transfer to real faces -> heuristic leads
-            self.eye_cnn_weight = self.mouth_cnn_weight = 0.25
+            self.eye_cnn_weight = 0.85
+            self.mouth_cnn_weight = 0.85
 
         # 3) YOLOv8 person detector (optional)
         self.yolo = None
@@ -140,6 +150,7 @@ class DrowsinessDetector:
         self.frame_idx = 0
         self._closed_run = 0
         self._yawn_run = 0
+        self._tired_run = 0
         self._eye_hist = []
         self._mouth_hist = []
         self._glasses_hist = []
@@ -147,15 +158,26 @@ class DrowsinessDetector:
         self._last_face = None
         self._dbg_frame = None
         self._last_mouth_contrast = None
+        # debounced alert state (candidate holds for state_hold_frames)
+        self._alert_now = None
+        self._cand_label = None
+        self._cand_count = 0
 
     # ------------------------------------------------------------------ setup
     def _load_cnn(self, path):
-        net = SmallCNN(2)
-        if os.path.exists(path):
-            net.load_state_dict(torch.load(path, map_location=self.device))
-            net.to(self.device).eval()
-        else:
+        if not path or not os.path.exists(path):
             print(f"[detector] missing weights {path} - CNN not loaded")
+            return None
+        state = torch.load(path, map_location=self.device)
+        num_classes = 2
+        for key in ("classifier.4.weight", "classifier.3.weight", "classifier.4.bias"):
+            if key in state:
+                num_classes = state[key].shape[0]
+                break
+        net = SmallCNN(num_classes=num_classes)
+        net.load_state_dict(state)
+        net.to(self.device).eval()
+        net.num_classes = num_classes
         return net
 
     def _cnn_probs(self, net, crop_bgr):
@@ -186,51 +208,47 @@ class DrowsinessDetector:
         return None if prob is None else float(prob[1])
 
     def _predict(self, net, crop_bgr, kind):
-        """Resize + normalise a BGR crop and run the binary CNN.
+        """Resize + normalise a BGR crop and run the CNN.
 
-        With fine-tuned (real) weights the CNN alone is the most reliable signal
-        (tuned on the user's calibration crops, ~0.87 eyes / ~0.83 mouth), so it
-        decides directly at a standard 0.5 threshold. The pixel-heuristic fusion
-        below is only used as a fallback for the synthetic-only weights, where the
-        CNN does not transfer to real faces."""
+        For eyes:
+          - If a 3-class model is loaded, returns (pred_class, prob_array).
+          - If a 2-class model is loaded, returns (pred_bin, p_open).
+        For mouth:
+          - Uses a CNN-only threshold (p_yawn >= mouth_yawn_thresh) without
+            gating on the contrast heuristic, eliminating false negatives on
+            darker or lower-contrast yawns.
+        """
         if crop_bgr is None or crop_bgr.size == 0 or net is None:
             return None, None
         prob = self._cnn_probs(net, crop_bgr)
         if prob is None:
             return None, None
-        if self.using_real_model:
-            if kind == "eye":
-                return (0 if prob[0] >= 0.5 else 1), float(prob[0])
-            # mouth: only report a yawn when the mouth actually looks open.
-            # the yawn CNN can fire on a closed mouth (noisy training labels),
-            # so gate it on the mouth-openness contrast heuristic. A wide-open
-            # mouth is bright inside (teeth) -> high std; a closed mouth shows
-            # only a thin dark line -> low std.
-            gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
-            band = gray[int(gray.shape[0] * 0.25):int(gray.shape[0] * 0.75), :]
-            contrast = float(band.std())
-            is_open = contrast >= MOUTH_OPEN_CONTRAST
-            self._last_mouth_contrast = contrast
-            return (1 if (is_open and prob[1] >= 0.5) else 0), float(prob[1])
 
-        gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
-        h = gray.shape[0]
         if kind == "eye":
-            # best pixel discriminator found on real crops: dark fraction of a
-            # wide band (open 0.887 vs closed 0.832 mean); weak but directional
-            band = gray[int(h * 0.15):int(h * 0.85), :]
-            dark = float((band < 60).mean())
-            h_open = float(np.clip((dark - 0.84) / 0.12, 0.0, 1.0))
-            fused = self.eye_cnn_weight * float(prob[0]) + (1 - self.eye_cnn_weight) * h_open
-            return (0 if fused >= 0.5 else 1), fused
-        else:  # mouth
-            # best pixel discriminator: contrast of the middle band
-            # (yawn 29.9 vs no_yawn 16.5 mean); a wide-open mouth is bright inside
-            band = gray[int(h * 0.25):int(h * 0.75), :]
-            contrast = float(band.std())
-            h_yawn = float(np.clip((contrast - 20) / 20, 0.0, 1.0))
-            fused = self.mouth_cnn_weight * float(prob[1]) + (1 - self.mouth_cnn_weight) * h_yawn
-            return (1 if fused >= 0.5 else 0), fused
+            num_classes = getattr(net, "num_classes", 2)
+            if num_classes == 3:
+                pred_class = int(np.argmax(prob))
+                return pred_class, prob
+            else:
+                p_open = float(prob[0])
+                pred_bin = 0 if p_open >= 0.5 else 1
+                return pred_bin, p_open
+
+        # mouth: compute contrast for telemetry / diag
+        gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+        band = gray[int(gray.shape[0] * 0.25):int(gray.shape[0] * 0.75), :]
+        self._last_mouth_contrast = float(band.std())
+
+        if self.using_real_model:
+            p_yawn = float(prob[1])
+            is_yawn = 1 if p_yawn >= self.mouth_yawn_thresh else 0
+            return is_yawn, p_yawn
+
+        # synthetic fallback
+        contrast = self._last_mouth_contrast
+        h_yawn = float(np.clip((contrast - 20) / 20, 0.0, 1.0))
+        fused = self.mouth_cnn_weight * float(prob[1]) + (1 - self.mouth_cnn_weight) * h_yawn
+        return (1 if fused >= 0.5 else 0), fused
 
     # --------------------------------------------------------------- helpers
     @staticmethod
@@ -239,9 +257,89 @@ class DrowsinessDetector:
             return None
         return 1 if sum(hist) > len(hist) // 2 else 0
 
+    @staticmethod
+    def _eye_class(eye_res):
+        """Map eye prediction (3-class output or 2-class p_open) to OPEN / TIRED / CLOSED.
+
+        3-class model: directly returns predicted class 0 (open), 1 (tired), 2 (closed).
+        2-class model: maps openness probability via confidence bands:
+          - p_open >= EYE_OPEN_P (0.70) -> OPEN
+          - p_open < EYE_CLOSED_P (0.34) -> CLOSED
+          - in-between -> TIRED (droopy / ambiguous)
+        """
+        if isinstance(eye_res, (int, np.integer)):
+            return int(eye_res)
+        if isinstance(eye_res, (list, tuple, np.ndarray)):
+            if len(eye_res) == 3:
+                return int(np.argmax(eye_res))
+            eye_res = eye_res[0]
+        p_open = float(eye_res)
+        if p_open >= EYE_OPEN_P:
+            return EYE_OPEN
+        if p_open < EYE_CLOSED_P:
+            return EYE_CLOSED
+        return EYE_TIRED
+
+    @classmethod
+    def _combine_eyes(cls, eL_res, eR_res):
+        """Per-frame eye verdict from both eye results.
+
+        DROWSY needs BOTH eyes closed; TIRED needs at least one eye reading
+        tired while neither is actually closed. Otherwise the frame counts as
+        open (a single blinking / squinting eye must never alarm)."""
+        lc, rc = cls._eye_class(eL_res), cls._eye_class(eR_res)
+        if lc == EYE_CLOSED and rc == EYE_CLOSED:
+            return EYE_CLOSED
+        if lc != EYE_CLOSED and rc != EYE_CLOSED and (lc == EYE_TIRED or rc == EYE_TIRED):
+            return EYE_TIRED
+        return EYE_OPEN
+
+    @classmethod
+    def _majority_code(cls, hist):
+        """Most frequent eye class in the smoothing window (ties -> OPEN)."""
+        if not hist:
+            return EYE_OPEN
+        counts = {}
+        for x in hist:
+            counts[x] = counts.get(x, 0) + 1
+        best = max(counts.values())
+        candidates = [k for k, v in counts.items() if v == best]
+        return EYE_OPEN if EYE_OPEN in candidates else candidates[0]
+
     def _reset_runs(self):
         self._closed_run = 0
         self._yawn_run = 0
+        self._tired_run = 0
+
+    def _resolve_alert(self, desired):
+        """Debounce helper: a new alert only commits after state_hold_frames
+        of continuous support, so an unsure model cannot flicker between
+        states. NO FACE (context loss) and the first frame commit instantly."""
+        if desired == "NO FACE":
+            self._alert_now = "NO FACE"
+            self._cand_label = None
+            self._cand_count = 0
+            return "NO FACE"
+        if self._alert_now is None or self._alert_now == "NO FACE":
+            self._alert_now = desired
+            self._cand_label = None
+            self._cand_count = 0
+            return desired
+        if desired == self._alert_now:
+            self._cand_label = None
+            self._cand_count = 0
+            return desired
+        if desired == self._cand_label:
+            self._cand_count += 1
+        else:
+            self._cand_label = desired
+            self._cand_count = 1
+        if self._cand_count >= max(1, self.state_hold_frames):
+            self._alert_now = desired
+            self._cand_label = None
+            self._cand_count = 0
+            return desired
+        return self._alert_now
 
     # -------------------------------------------------------------- main pass
     def process_frame(self, frame_bgr):
@@ -253,7 +351,7 @@ class DrowsinessDetector:
         status = {
             "driver_present": False, "face": False,
             "eye_left": None, "eye_right": None, "mouth": None,
-            "drowsy": False, "yawning": False,
+            "drowsy": False, "yawning": False, "tired": False,
             "alert": "SAFE",
         }
 
@@ -270,40 +368,19 @@ class DrowsinessDetector:
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 1)
                     break
 
-        # ---- 2) face localisation.
-        # IMPORTANT: identical cascade settings to collect_calibration.py
-        # (minNeighbors=5, minSize=90) so live crops match the calibration
-        # crops the CNNs were trained on. No looser fallback: a differently
-        # sized face box would misplace the eye/mouth crops.
-        faces = self.face_cascade.detectMultiScale(
-            gray, scaleFactor=1.1, minNeighbors=5, minSize=(90, 90))
-
-        # Only run eye/mouth classification when a face is detected in the
-        # CURRENT frame. A stale last-known box may contain background, so it
-        # must never be used for drowsy/yawn decisions.
-        if len(faces):
-            face = faces[0]
-            self._last_face = face
-        else:
-            face = None
+        # ---- 2) face localisation via shared pitch-robust cascades
+        face = detect_face(gray)
 
         if face is not None:
-            fx, fy, fw, fh = face
+            fx, fy, fw, fh = map(int, face)
+            face = (fx, fy, fw, fh)
+            self._last_face = face
             status["face"] = True
             status["driver_present"] = True
 
-            # geometric eye strip (upper ~45% of the face)
-            eye_strip_y1 = fy + int(fh * 0.15)
-            eye_strip_y2 = fy + int(fh * 0.55)
-            lx, lw = fx + int(fw * 0.05), int(fw * 0.42)
-            rx = fx + int(fw * 0.53)
-            left_eye = frame_bgr[eye_strip_y1:eye_strip_y2, lx:lx + lw]
-            right_eye = frame_bgr[eye_strip_y1:eye_strip_y2, rx:rx + lw]
-
-            # mouth region (generous: a wide yawn can grow outside a tight box)
-            my1, my2 = fy + int(fh * 0.55), fy + int(fh * 0.97)
-            mx, mw = fx + int(fw * 0.22), int(fw * 0.56)
-            mouth = frame_bgr[my1:my2, mx:mx + mw]
+            # Localize and crop regions using shared crops logic
+            le_box, re_box, mouth_box = localize_regions(frame_bgr, face)
+            left_eye, right_eye, mouth = crop_regions(frame_bgr, face)
 
             # glasses state: fixed at startup (no re-check) or auto-detected
             # every frame via the glasses-vs-no-glasses classifier
@@ -324,8 +401,10 @@ class DrowsinessDetector:
             eL, eLc = self._predict(eye_net, left_eye, "eye")
             eR, eRc = self._predict(eye_net, right_eye, "eye")
             mS, mSc = self._predict(self.mouth_net, mouth, "mouth")
-            status["eye_left"] = "closed" if eL == 1 else "open"
-            status["eye_right"] = "closed" if eR == 1 else "open"
+
+            # three-way per-eye label: open / tired / closed
+            status["eye_left"] = EYE_LABELS[self._eye_class(eLc)]
+            status["eye_right"] = EYE_LABELS[self._eye_class(eRc)]
             status["mouth"] = "yawn" if mS == 1 else "no_yawn"
 
             # diagnostics (used by the tuning script; no effect on behaviour)
@@ -333,26 +412,30 @@ class DrowsinessDetector:
                 "frame": self.frame_idx,
                 "glasses": self.glasses_now if self.glasses_ok else None,
                 "eL": eL, "eR": eR, "mS": mS,
-                "eLc": float(eLc) if eLc is not None else None,
-                "eRc": float(eRc) if eRc is not None else None,
+                "eLc": eLc, "eRc": eRc,
                 "mSc": float(mSc) if mSc is not None else None,
                 "mouth_contrast": getattr(self, "_last_mouth_contrast", None),
                 "closed_run": self._closed_run, "yawn_run": self._yawn_run,
+                "tired_run": self._tired_run,
             }
 
             # temporal smoothing via majority vote (drowsy requires BOTH eyes
             # closed - a single misclassified/blinking eye must not alarm)
-            self._eye_hist.append(1 if (eL == 1 and eR == 1) else 0)
+            self._eye_hist.append(self._combine_eyes(eLc, eRc))
             self._mouth_hist.append(mS)
             if len(self._eye_hist) > self.smooth_win:
                 self._eye_hist.pop(0)
             if len(self._mouth_hist) > self.smooth_win:
                 self._mouth_hist.pop(0)
-            closed_now = self._majority(self._eye_hist) == 1
+            eye_state = self._majority_code(self._eye_hist)
+            closed_now = eye_state == EYE_CLOSED
+            tired_now = eye_state == EYE_TIRED
             yawn_now = self._majority(self._mouth_hist) == 1
 
             self._closed_run = self._closed_run + 1 if closed_now else 0
             self._yawn_run = self._yawn_run + 1 if yawn_now else 0
+            # tired (eyes only, no yawn) requires its own sustained streak
+            self._tired_run = self._tired_run + 1 if (tired_now and not yawn_now) else 0
 
             # draw overlays
             color = (0, 255, 0)
@@ -362,11 +445,17 @@ class DrowsinessDetector:
             elif self._yawn_run >= self.yawn_frames:
                 status["yawning"] = True
                 color = (0, 165, 255)
+            elif self._tired_run >= self.tired_frames:
+                status["tired"] = True
+                color = (0, 210, 255)
 
+            lx, ly, lw, lh = le_box
+            rx, ry, rw, rh = re_box
+            mx, my, mw, mh = mouth_box
             cv2.rectangle(frame_bgr, (fx, fy), (fx + fw, fy + fh), color, 2)
-            cv2.rectangle(frame_bgr, (lx, eye_strip_y1), (lx + lw, eye_strip_y2), (255, 255, 255), 1)
-            cv2.rectangle(frame_bgr, (rx, eye_strip_y1), (rx + lw, eye_strip_y2), (255, 255, 255), 1)
-            cv2.rectangle(frame_bgr, (mx, my1), (mx + mw, my2), (255, 255, 255), 1)
+            cv2.rectangle(frame_bgr, (lx, ly), (lx + lw, ly + lh), (255, 255, 255), 1)
+            cv2.rectangle(frame_bgr, (rx, ry), (rx + rw, ry + rh), (255, 255, 255), 1)
+            cv2.rectangle(frame_bgr, (mx, my), (mx + mw, my + mh), (255, 255, 255), 1)
             cv2.putText(frame_bgr, f"eyes: L {status['eye_left']} / R {status['eye_right']}",
                         (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
             cv2.putText(frame_bgr, f"mouth: {status['mouth']}", (10, 48),
@@ -376,10 +465,7 @@ class DrowsinessDetector:
                 cv2.putText(frame_bgr, f"glasses: {'yes' if self.glasses_now else 'no'}{tag}",
                             (10, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
         else:
-            # no face in the frame -> make NO prediction at all: eye/mouth stay
-            # None, the alert reports NO FACE, and any in-progress drowsy/yawn
-            # counters are reset so a freshly-detected face cannot alarm on a
-            # stale streak.
+            # no face in the frame -> make NO prediction at all
             status["driver_present"] = yolo_person
             status["alert"] = "NO FACE"
             self._reset_runs()
@@ -387,16 +473,27 @@ class DrowsinessDetector:
             self._mouth_hist.clear()
             self._dbg_frame = None
 
-        # ---- 3) final alert level (NO FACE already set above; never predict
-        # a state for a frame that had no face)
+        # ---- 3) final alert level.
+        # Priority: NO FACE > DROWSY > YAWNING > TIRED > SAFE.
+        # A yawn in progress never resolves to SAFE.
+        desired = "SAFE"
         if status["alert"] == "NO FACE":
-            pass
+            desired = "NO FACE"
         elif status["drowsy"]:
-            status["alert"] = "DROWSY"
+            desired = "DROWSY"
         elif status["yawning"]:
+            desired = "YAWNING"
+        elif status["tired"]:
+            desired = "TIRED"
+
+        # debounce: a candidate alert must survive state_hold_frames before the
+        # display switches, so an unsure model cannot flicker state to state.
+        status["alert"] = self._resolve_alert(desired)
+        if status["yawning"] and status["alert"] == "SAFE":
             status["alert"] = "YAWNING"
-        else:
-            status["alert"] = "SAFE"
+        status["drowsy"] = status["alert"] == "DROWSY"
+        status["yawning"] = status["alert"] == "YAWNING"
+        status["tired"] = status["alert"] == "TIRED"
 
         self._draw_status(frame_bgr, status)
         return frame_bgr, status
@@ -405,7 +502,8 @@ class DrowsinessDetector:
         h, w = frame_bgr.shape[:2]
         txt = status["alert"]
         color = {"SAFE": (0, 255, 0), "DROWSY": (0, 0, 255),
-                 "YAWNING": (0, 165, 255), "NO FACE": (220, 220, 220)}[txt]
+                 "YAWNING": (0, 165, 255), "TIRED": (0, 210, 255),
+                 "NO FACE": (220, 220, 220)}[txt]
         cv2.rectangle(frame_bgr, (w // 2 - 140, 12), (w // 2 + 140, 52), (0, 0, 0), -1)
         cv2.putText(frame_bgr, f"STATE: {txt}", (w // 2 - 110, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
@@ -422,6 +520,8 @@ class DrowsinessDetector:
 def detect_image(detector, image_path, output_path=None):
     """Classify a single uploaded image. Returns annotated BGR frame + status."""
     detector.beep_alerts = False
+    # one frame only: commit its verdict immediately (no debounce wait)
+    detector.state_hold_frames = 1
     img = cv2.imread(image_path)
     if img is None:
         raise FileNotFoundError(f"cannot read image: {image_path}")

@@ -22,6 +22,7 @@ glasses-vs-no-glasses classifier (models/glasses_cnn.pth, src/train_glasses.py).
 """
 
 import os
+import sys
 import numpy as np
 import pandas as pd
 import torch
@@ -32,8 +33,13 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
-from train import (ImageFolderDS, build_dfs, SmallCNN,
-                   train_one, evaluate, DEVICE, BATCH_SIZE, LR)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from train import (ImageFolderDS, build_dfs, SmallCNN,
+                       train_one, evaluate, DEVICE, BATCH_SIZE, LR)
+except ImportError:
+    from src.train import (ImageFolderDS, build_dfs, SmallCNN,
+                           train_one, evaluate, DEVICE, BATCH_SIZE, LR)
 
 CAL_ROOT = "data/calibration"
 REPEAT_REAL = 4          # repeats of each real crop inside the training set
@@ -101,7 +107,7 @@ def make_cal_df(kind, glasses=None):
             rows.append({"path": os.path.join(path, n), "label": label,
                          "glasses": 1 if n.endswith("_g.png") else 0})
     cal = pd.DataFrame(rows)
-    if glasses is not None:
+    if glasses is not None and not cal.empty:
         cal = cal[cal["glasses"] == glasses].reset_index(drop=True)
     return cal
 
@@ -128,7 +134,7 @@ def finetune(kind, out_path, pretrained_path, glasses=None):
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
-    # transfer learning: start from the synthetic model
+    # transfer learning: start from the base model
     model = SmallCNN(2)
     model.load_state_dict(torch.load(pretrained_path, map_location="cpu"))
     model.to(DEVICE)
